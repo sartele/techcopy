@@ -1,0 +1,140 @@
+<?php
+// ============================================================
+//  TechCopy — Autenticazione e Sessione
+//
+//  GERARCHIA RUOLI:
+//  admin      → tutto: CRUD completo, gestione utenti, elimina ticket
+//  supervisor → vede tutti gli interventi, inserisce clienti/stampanti/
+//               ticket/consumabili, modifica quantità stock
+//  tech       → inserisce ticket, gestisce solo i propri ticket,
+//               vede mappa clienti
+//  viewer     → sola lettura su tutto, nessuna modifica
+// ============================================================
+
+require_once __DIR__ . '/config.php';
+
+function session_init(): void {
+    if (session_status() === PHP_SESSION_NONE) {
+        session_name('techcopy_session');
+        session_start();
+    }
+}
+
+function current_user(): ?array {
+    session_init();
+    return $_SESSION['user'] ?? null;
+}
+
+function require_login(): void {
+    if (!current_user()) {
+        header('Location: /techcopy/login.php');
+        exit;
+    }
+}
+
+function require_role(string ...$roles): void {
+    require_login();
+    $user = current_user();
+    if (!in_array($user['role'], $roles)) {
+        http_response_code(403);
+        die('<h2 style="font-family:sans-serif;color:#f44747;padding:40px">⛔ Accesso non autorizzato per il tuo ruolo.</h2>');
+    }
+}
+
+// ── Singoli ruoli ─────────────────────────────────────────
+function is_admin(): bool {
+    $u = current_user(); return $u && $u['role'] === 'admin';
+}
+function is_supervisor(): bool {
+    $u = current_user(); return $u && $u['role'] === 'supervisor';
+}
+function is_tech(): bool {
+    $u = current_user(); return $u && $u['role'] === 'tech';
+}
+function is_viewer(): bool {
+    $u = current_user(); return $u && $u['role'] === 'viewer';
+}
+
+// ── Combinazioni permessi ─────────────────────────────────
+
+/** Admin + Supervisor: vedono tutti i ticket, gestiscono clienti/stampanti */
+function is_admin_or_supervisor(): bool {
+    $u = current_user();
+    return $u && in_array($u['role'], ['admin','supervisor']);
+}
+
+/** Admin + Supervisor + Tech: possono creare ticket */
+function can_create_ticket(): bool {
+    $u = current_user();
+    return $u && in_array($u['role'], ['admin','supervisor','tech']);
+}
+
+/** Admin + Supervisor: gestione consumabili (inserimento + quantità) */
+function can_manage_consumables(): bool {
+    $u = current_user();
+    return $u && in_array($u['role'], ['admin','supervisor']);
+}
+
+/** Admin + Supervisor: CRUD clienti */
+function can_manage_clients(): bool {
+    $u = current_user();
+    return $u && in_array($u['role'], ['admin','supervisor']);
+}
+
+/** Admin + Supervisor: CRUD stampanti */
+function can_manage_printers(): bool {
+    $u = current_user();
+    return $u && in_array($u['role'], ['admin','supervisor']);
+}
+
+/** Tutti i ruoli autenticati vedono la mappa */
+function can_view_map(): bool {
+    return current_user() !== null;
+}
+
+/**
+ * Filtro tecnico per la lista ticket.
+ * Tech → vede solo i suoi (ritorna il suo id).
+ * Admin/Supervisor/Viewer → vedono tutti (ritorna null).
+ */
+function ticket_tech_filter(): ?int {
+    $u = current_user();
+    if (!$u) return null;
+    return ($u['role'] === 'tech') ? (int)$u['id'] : null;
+}
+
+/**
+ * Può modificare un ticket?
+ * Admin/Supervisor → sempre.
+ * Tech → solo se assegnato a lui.
+ * Viewer → mai.
+ */
+function can_edit_ticket(int $techId): bool {
+    $u = current_user();
+    if (!$u) return false;
+    if (in_array($u['role'], ['admin','supervisor'])) return true;
+    if ($u['role'] === 'tech' && (int)$u['id'] === $techId) return true;
+    return false;
+}
+
+/** Alias retrocompatibilità */
+function is_tech_or_admin(): bool { return can_create_ticket(); }
+
+// ── Login / Logout ────────────────────────────────────────
+function login_user(string $email, string $password): array|false {
+    $stmt = db()->prepare('SELECT * FROM users WHERE email=? AND active=1');
+    $stmt->execute([$email]);
+    $user = $stmt->fetch();
+    if ($user && password_verify($password, $user['password'])) {
+        unset($user['password']);
+        session_init();
+        $_SESSION['user'] = $user;
+        return $user;
+    }
+    return false;
+}
+
+function logout_user(): void {
+    session_init();
+    session_destroy();
+}

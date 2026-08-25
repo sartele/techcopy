@@ -1,0 +1,630 @@
+<?php
+require_once __DIR__ . '/../includes/layout.php';
+require_once __DIR__ . '/../includes/notifications.php';
+require_login();
+$db = db();
+$me = current_user();
+
+// ── ACTIONS ──────────────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    csrf_verify();
+    $action = $_POST['action'] ?? '';
+
+    if ($action === 'create' && can_create_ticket()) {
+        $stmt = $db->prepare("INSERT INTO tickets (client_id,printer_id,tech_id,status,priority,type,title,description,travel_time,work_time,counter_bw,counter_color) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
+        $stmt->execute([
+            $_POST['client_id'], $_POST['printer_id']?:null, $_POST['tech_id']?:null,
+            'open', $_POST['priority'], $_POST['type'],
+            trim($_POST['title']), trim($_POST['description']),
+            (int)($_POST['travel_time']??0), (int)($_POST['work_time']??0),
+            (int)($_POST['counter_bw']??0), (int)($_POST['counter_color']??0),
+        ]);
+        $newId = $db->lastInsertId();
+        log_ticket($newId, $me['id'], $me['name'], 'Ticket aperto');
+        // Aggiungi il responsabile principale in ticket_users
+        if (!empty($_POST['tech_id'])) {
+            $db->prepare("INSERT IGNORE INTO ticket_users (ticket_id,user_id,role_note) VALUES (?,?,'Responsabile')")
+               ->execute([$newId, (int)$_POST['tech_id']]);
+        }
+        // ── Notifiche email ──────────────────────────────────────
+        notify_ticket_created($newId, $me);
+        if (!empty($_POST['tech_id']) && (int)$_POST['tech_id'] !== (int)$me['id']) {
+            notify_ticket_assigned($newId, (int)$_POST['tech_id'], $me);
+        }
+        flash("Intervento #{$newId} creato ✅");
+        redirect('/techcopy/pages/tickets.php');
+    }
+
+    if ($action === 'update') {
+        $id  = (int)$_POST['ticket_id'];
+        $row = $db->prepare("SELECT tech_id, status FROM tickets WHERE id=?"); $row->execute([$id]); $row=$row->fetch();
+        if (!$row) { flash('Intervento non trovato.','error'); redirect('/techcopy/pages/tickets.php'); }
+        if (!can_edit_ticket((int)($row['tech_id']??0))) {
+            flash('Non hai i permessi per modificare questo intervento.','error');
+            redirect('/techcopy/pages/tickets.php');
+        }
+        // Se "risolto" → forza status=closed
+        $resolved       = isset($_POST['resolved']) ? 1 : 0;
+        $allowed        = ['open','pending','closed'];
+        $postedStatus   = in_array($_POST['status']??'', $allowed) ? $_POST['status'] : 'open';
+        $status         = $resolved ? 'closed' : $postedStatus;
+        $closed_at      = ($status === 'closed') ? date('Y-m-d H:i:s') : null;
+
+        $db->prepare("UPDATE tickets SET status=?,priority=?,type=?,tech_id=?,title=?,description=?,notes=?,work_report=?,travel_time=?,work_time=?,counter_bw=?,counter_color=?,resolved=?,closed_at=?,updated_at=NOW() WHERE id=?")
+           ->execute([$status,$_POST['priority'],$_POST['type'],$_POST['tech_id']?:null,trim($_POST['title']),trim($_POST['description']),trim($_POST['notes']??''),trim($_POST['work_report']??''),(int)($_POST['travel_time']??0),(int)($_POST['work_time']??0),(int)($_POST['counter_bw']??0),(int)($_POST['counter_color']??0),$resolved,$closed_at,$id]);
+
+        // ── Parti sostituite + scarico automatico consumabili ──────────────────
+        // 1. Legge i componenti PRECEDENTI (con consumable_id e qty) per poter
+        //    ripristinare lo stock se vengono rimossi o ridotti
+        $oldParts = $db->prepare("SELECT consumable_id, quantity FROM ticket_parts WHERE ticket_id=? AND consumable_id IS NOT NULL");
+        $oldParts->execute([$id]);
+        $oldParts = $oldParts->fetchAll();
+
+        // Ripristina stock dei componenti precedenti (annulla lo scarico passato)
+        foreach ($oldParts as $op) {
+            if ($op['consumable_id']) {
+                $db->prepare("UPDATE consumables SET stock = stock + ? WHERE id=?")
+                   ->execute([$op['quantity'], $op['consumable_id']]);
+                $db->prepare("INSERT INTO stock_movements (consumable_id,ticket_id,user_id,type,quantity,notes) VALUES (?,?,?,?,?,?)")
+                   ->execute([$op['consumable_id'],$id,$me['id'],'carico',$op['quantity'],'Ripristino modifica intervento #'.$id]);
+            }
+        }
+
+        // 2. Elimina le vecchie righe e inserisce le nuove
+        $db->prepare("DELETE FROM ticket_parts WHERE ticket_id=?")->execute([$id]);
+
+        $consumableIds = $_POST['consumable_id']  ?? [];
+        $quantities    = $_POST['consumable_qty']  ?? [];
+        $freeTexts     = $_POST['part_free']       ?? [];  // componenti liberi non a magazzino
+
+        // Componenti collegati al magazzino
+        foreach ($consumableIds as $idx => $consId) {
+            $consId = (int)$consId;
+            $qty    = max(1, (int)($quantities[$idx] ?? 1));
+            if (!$consId) continue;
+
+            // Recupera nome dal DB per coerenza
+            $cons = $db->prepare("SELECT name, code, stock FROM consumables WHERE id=?");
+            $cons->execute([$consId]); $cons = $cons->fetch();
+            if (!$cons) continue;
+
+            $db->prepare("INSERT INTO ticket_parts (ticket_id,consumable_id,part_name,part_code,quantity) VALUES (?,?,?,?,?)")
+               ->execute([$id, $consId, $cons['name'], $cons['code'], $qty]);
+
+            // Scala lo stock (non va sotto zero)
+            $db->prepare("UPDATE consumables SET stock = GREATEST(0, stock - ?) WHERE id=?")
+               ->execute([$qty, $consId]);
+
+            // Registra il movimento
+            $db->prepare("INSERT INTO stock_movements (consumable_id,ticket_id,user_id,type,quantity,notes) VALUES (?,?,?,?,?,?)")
+               ->execute([$consId, $id, $me['id'], 'scarico', $qty, 'Usato in intervento #'.$id]);
+        }
+
+        // Componenti liberi (non a magazzino — testo libero)
+        foreach ($freeTexts as $txt) {
+            $txt = trim($txt);
+            if ($txt === '') continue;
+            $db->prepare("INSERT INTO ticket_parts (ticket_id,part_name,quantity) VALUES (?,?,1)")
+               ->execute([$id, $txt]);
+        }
+        // Upload allegato
+        if (!empty($_FILES['attachment']['name'])) {
+            $file = $_FILES['attachment'];
+            $mime = mime_content_type($file['tmp_name']);
+            if (allowed_upload($mime) && $file['size'] <= UPLOAD_MAX_MB*1024*1024) {
+                if (!is_dir(UPLOAD_DIR)) mkdir(UPLOAD_DIR, 0755, true);
+                $ext  = pathinfo($file['name'], PATHINFO_EXTENSION);
+                $dest = UPLOAD_DIR.'ticket_'.$id.'_'.time().'.'.$ext;
+                move_uploaded_file($file['tmp_name'], $dest);
+                $db->prepare("INSERT INTO ticket_files (ticket_id,user_id,filename,filepath,filesize,mime_type) VALUES (?,?,?,?,?,?)")
+                   ->execute([$id,$me['id'],$file['name'],$dest,$file['size'],$mime]);
+            }
+        }
+        // ── Sync assegnazioni multiple tecnici ──────────────────────
+        $newTechIds = array_filter(array_map('intval', $_POST['assigned_users'] ?? []));
+        // Aggiungi sempre il responsabile principale se selezionato
+        $mainTech = (int)($_POST['tech_id'] ?? 0);
+        if ($mainTech && !in_array($mainTech, $newTechIds)) {
+            $newTechIds[] = $mainTech;
+        }
+        // Rimuovi tutti gli assegnati precedenti e re-inserisci
+        $db->prepare("DELETE FROM ticket_users WHERE ticket_id=?")->execute([$id]);
+        foreach (array_unique($newTechIds) as $uid) {
+            if (!$uid) continue;
+            $roleNote = ($uid === $mainTech) ? 'Responsabile' : 'Supporto';
+            $db->prepare("INSERT IGNORE INTO ticket_users (ticket_id,user_id,role_note) VALUES (?,?,?)")
+               ->execute([$id, $uid, $roleNote]);
+        }
+
+        // ── Notifiche email ──────────────────────────────────────
+        // Recupera lo stato precedente per confronto (è già stato aggiornato nel DB,
+        // usiamo il valore che avevamo salvato prima nell'UPDATE)
+        $prevStatus = $row['status'] ?? 'open'; // $row è stato letto prima dell'UPDATE
+        $changeNote = $resolved ? 'Intervento marcato come risolto dal tecnico.' : '';
+        notify_ticket_updated($id, $prevStatus, $status, $me, $changeNote);
+        // Notifica assegnazione se il tecnico principale è cambiato
+        if ($mainTech && $mainTech !== (int)($row['tech_id'] ?? 0) && $mainTech !== (int)$me['id']) {
+            notify_ticket_assigned($id, $mainTech, $me);
+        }
+
+        $logMsg = $resolved ? "Intervento marcato come risolto — chiuso automaticamente" : "Aggiornato — Stato: {$status}";
+        log_ticket($id, $me['id'], $me['name'], $logMsg);
+        flash("Intervento #{$id} aggiornato ✅");
+        redirect('/techcopy/pages/tickets.php?id='.$id);
+    }
+
+    if ($action === 'delete' && is_admin()) {
+        $id = (int)$_POST['ticket_id'];
+        $db->prepare("DELETE FROM tickets WHERE id=?")->execute([$id]);
+        flash("Intervento eliminato.");
+        redirect('/techcopy/pages/tickets.php');
+    }
+}
+
+// ── DETTAGLIO SINGOLO ─────────────────────────────────────────
+$detailTicket = null;
+if (isset($_GET['id'])) {
+    $stmt = $db->prepare("
+        SELECT t.*,
+               c.name AS client_name, c.address, c.city AS client_city,
+               c.phone AS client_phone, c.lat, c.lng,
+               p.brand, p.model, p.serial, p.type AS printer_type,
+               p.rete_lan, p.rete_wifi, p.adf, p.has_duplex, p.has_scan,
+               u.name AS tech_name, u.color AS tech_color
+        FROM tickets t
+        LEFT JOIN clients  c ON c.id=t.client_id
+        LEFT JOIN printers p ON p.id=t.printer_id
+        LEFT JOIN users    u ON u.id=t.tech_id
+        WHERE t.id=?");
+    $stmt->execute([(int)$_GET['id']]);
+    $detailTicket = $stmt->fetch();
+    if ($detailTicket) {
+        $sh = $db->prepare("SELECT * FROM ticket_history WHERE ticket_id=? ORDER BY created_at ASC"); $sh->execute([$detailTicket['id']]); $detailTicket['history']=$sh->fetchAll();
+        $sp = $db->prepare("SELECT * FROM ticket_parts  WHERE ticket_id=?");                          $sp->execute([$detailTicket['id']]); $detailTicket['parts']  =$sp->fetchAll();
+        $sf = $db->prepare("SELECT * FROM ticket_files  WHERE ticket_id=?");                          $sf->execute([$detailTicket['id']]); $detailTicket['files']  =$sf->fetchAll();
+        // Tecnici aggiuntivi assegnati
+        $su = $db->prepare("SELECT tu.*, u.name AS user_name, u.avatar, u.color, u.role FROM ticket_users tu JOIN users u ON u.id=tu.user_id WHERE tu.ticket_id=? ORDER BY tu.added_at ASC"); $su->execute([$detailTicket['id']]); $detailTicket['assigned_users']=$su->fetchAll();
+    }
+}
+
+// ── LISTA ─────────────────────────────────────────────────────
+$filter      = $_GET['filter'] ?? 'all';
+$search      = $_GET['q'] ?? '';
+$techFilter  = ticket_tech_filter();
+
+$where  = '1=1'; $params = [];
+if ($filter === 'open')    { $where .= " AND t.status='open'"; }
+if ($filter === 'pending') { $where .= " AND t.status='pending'"; }
+if ($filter === 'closed')  { $where .= " AND t.status='closed'"; }
+if ($techFilter)           { $where .= " AND (t.tech_id=? OR EXISTS(SELECT 1 FROM ticket_users tu WHERE tu.ticket_id=t.id AND tu.user_id=?))"; $params[] = $techFilter; $params[] = $techFilter; }
+if ($search)               { $where .= " AND (t.title LIKE ? OR c.name LIKE ?)"; $params[] = "%$search%"; $params[] = "%$search%"; }
+
+$stmt = $db->prepare("SELECT t.*,c.name AS client_name,u.name AS tech_name,u.color AS tech_color,p.brand,p.model,
+    (SELECT COUNT(*)-1 FROM ticket_users tu WHERE tu.ticket_id=t.id) AS extra_count
+    FROM tickets t LEFT JOIN clients c ON c.id=t.client_id LEFT JOIN users u ON u.id=t.tech_id LEFT JOIN printers p ON p.id=t.printer_id WHERE $where ORDER BY FIELD(t.priority,'urgent','high','normal'),t.created_at DESC");
+$stmt->execute($params); $tickets = $stmt->fetchAll();
+
+// Contatori filtrati per lo stesso scope della lista
+$wc = '1=1'; $pc = [];
+if ($techFilter) { $wc .= " AND (tech_id=? OR EXISTS(SELECT 1 FROM ticket_users tu WHERE tu.ticket_id=tickets.id AND tu.user_id=?))"; $pc[] = $techFilter; $pc[] = $techFilter; }
+$sc = $db->prepare("SELECT status,COUNT(*) AS n FROM tickets WHERE $wc GROUP BY status");
+$sc->execute($pc);
+$counts   = $sc->fetchAll(PDO::FETCH_KEY_PAIR);
+$allCount = array_sum($counts);
+
+$clients     = $db->query("SELECT id,name FROM clients WHERE active=1 ORDER BY name")->fetchAll();
+$consumables = $db->query("SELECT id,name,code,brand,type,color,stock,unit FROM consumables ORDER BY type,name")->fetchAll();
+$techUsers = $db->query("SELECT id,name,role FROM users WHERE role IN ('admin','supervisor','tech') AND active=1 ORDER BY FIELD(role,'admin','supervisor','tech'),name")->fetchAll();
+
+layout_header('Interventi', 'tickets');
+?>
+
+<?php if ($detailTicket): ?>
+<!-- ══ DETTAGLIO TICKET ══════════════════════════════════════ -->
+<?php $t = $detailTicket; $canEdit = can_edit_ticket((int)($t['tech_id']??0), (int)$t['id']); ?>
+
+<div style="margin-bottom:16px;display:flex;gap:8px;flex-wrap:wrap">
+  <a href="/techcopy/pages/tickets.php" class="btn btn-secondary btn-sm">← Torna alla lista</a>
+  <a href="/techcopy/pages/report_ticket.php?id=<?= $t['id'] ?>" target="_blank" class="btn btn-secondary btn-sm">📄 Stampa Rapporto</a>
+</div>
+
+<div class="table-wrap" style="padding:0;margin-bottom:24px">
+  <div style="padding:20px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <span class="ticket-id" style="font-size:16px">#<?= str_pad($t['id'],4,'0',STR_PAD_LEFT) ?></span>
+    <h3 style="flex:1;font-size:18px"><?= h($t['title']) ?></h3>
+    <?= status_badge($t['status']) ?>
+    <?= priority_badge($t['priority']) ?>
+    <span class="chip"><?= h($t['type']) ?></span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab(this,'overview')">📋 Panoramica</div>
+  <div class="tab" onclick="switchTab(this,'work')">🔧 Lavoro</div>
+  <div class="tab" onclick="switchTab(this,'history')">📜 Cronologia</div>
+  <?php if ($canEdit): ?><div class="tab" onclick="switchTab(this,'edit')">✏️ Modifica</div><?php endif; ?>
+</div>
+
+<!-- PANORAMICA -->
+<div data-tab="overview">
+  <div class="info-grid" style="margin-bottom:20px">
+    <div class="info-box"><div class="info-label">Cliente</div><div class="info-value">🏢 <a href="/techcopy/pages/clients.php?id=<?= $t['client_id'] ?>" style="color:var(--accent)"><?= h($t['client_name']) ?></a></div></div>
+    <div class="info-box"><div class="info-label">Stampante</div><div class="info-value">🖨️ <?= h($t['brand'].' '.$t['model']) ?><br><small style="font-family:var(--mono);color:var(--text2)"><?= h($t['serial']) ?></small></div></div>
+    <div class="info-box"><div class="info-label">Team assegnato</div><div class="info-value">
+      <?php if (!empty($t['assigned_users'])): ?>
+        <?php foreach ($t['assigned_users'] as $au): ?>
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+          <div style="width:22px;height:22px;border-radius:50%;background:<?= h($au['color']) ?>22;color:<?= h($au['color']) ?>;border:1.5px solid <?= h($au['color']) ?>;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0"><?= h($au['avatar']) ?></div>
+          <span style="font-size:13px"><?= h($au['user_name']) ?></span>
+          <span style="font-size:10px;color:var(--text3);font-family:var(--mono)"><?= h($au['role_note'] ?? '') ?></span>
+        </div>
+        <?php endforeach; ?>
+      <?php elseif ($t['tech_name']): ?>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="color:<?= h($t['tech_color']??'var(--text2)') ?>">👤 <?= h($t['tech_name']) ?></span>
+        </div>
+      <?php else: ?>—<?php endif; ?>
+    </div></div>
+    <div class="info-box"><div class="info-label">Data apertura</div><div class="info-value" style="font-family:var(--mono);font-size:12px"><?= h($t['created_at']) ?></div></div>
+    <div class="info-box"><div class="info-label">Ultimo aggiornamento</div><div class="info-value" style="font-family:var(--mono);font-size:12px"><?= h($t['updated_at']) ?></div></div>
+    <div class="info-box"><div class="info-label">Risolto</div><div class="info-value"><span class="badge <?= $t['resolved']?'badge-closed':'badge-open' ?>"><?= $t['resolved']?'✅ Sì':'⏳ No' ?></span></div></div>
+  </div>
+  <div class="section-title">Descrizione problema</div>
+  <div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:20px;font-size:14px;line-height:1.6;color:var(--text2)"><?= nl2br(h($t['description'])) ?></div>
+  <?php if (!empty($t['work_report'])): ?>
+  <div class="section-title" style="color:var(--accent);border-bottom-color:var(--accent)">📋 Lavoro svolto</div>
+  <div style="background:var(--surface2);border:1px solid var(--accent);border-radius:var(--radius);padding:16px;margin-bottom:20px;font-size:14px;line-height:1.7;white-space:pre-wrap"><?= h($t['work_report']) ?></div>
+  <?php endif; ?>
+  <div class="section-title">Sede cliente</div>
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:8px">
+    <span>📍 <?= h($t['address'].', '.$t['client_city']) ?></span>
+    <a href="https://www.openstreetmap.org/search?query=<?= urlencode($t['address'].', '.$t['client_city']) ?>" target="_blank" class="btn btn-secondary btn-sm">🗺️ OpenStreetMap</a>
+    <a href="https://www.google.com/maps/search/?api=1&query=<?= urlencode($t['address'].', '.$t['client_city']) ?>" target="_blank" class="btn btn-secondary btn-sm">🔍 Google Maps</a>
+    <a href="https://waze.com/ul?q=<?= urlencode($t['address'].', '.$t['client_city']) ?>" target="_blank" class="btn btn-secondary btn-sm">🚗 Waze</a>
+  </div>
+</div>
+
+<!-- LAVORO -->
+<div data-tab="work" class="hidden">
+  <div class="info-grid" style="margin-bottom:20px">
+    <div class="info-box"><div class="info-label">Tempo spostamento</div><div class="info-value" style="font-family:var(--mono)"><?= format_minutes((int)$t['travel_time']) ?></div></div>
+    <div class="info-box"><div class="info-label">Tempo lavoro</div><div class="info-value" style="font-family:var(--mono)"><?= format_minutes((int)$t['work_time']) ?></div></div>
+    <div class="info-box"><div class="info-label">Totale</div><div class="info-value" style="font-family:var(--mono);color:var(--accent)"><?= format_minutes((int)$t['travel_time']+(int)$t['work_time']) ?></div></div>
+    <div class="info-box"><div class="info-label">Contatore BN (intervento)</div><div class="info-value" style="font-family:var(--mono)"><?= number_format((int)$t['counter_bw']) ?></div></div>
+    <div class="info-box"><div class="info-label">Contatore Colore (intervento)</div><div class="info-value" style="font-family:var(--mono)"><?= number_format((int)$t['counter_color']) ?></div></div>
+    <?php if ($t['closed_at']): ?><div class="info-box"><div class="info-label">Chiuso il</div><div class="info-value" style="font-family:var(--mono);font-size:12px"><?= h($t['closed_at']) ?></div></div><?php endif; ?>
+  </div>
+  <?php if (!empty($t['parts'])): ?>
+  <div class="section-title">Componenti sostituiti</div>
+  <div style="margin-bottom:20px">
+    <?php foreach($t['parts'] as $p):
+      $isLinked = !empty($p['consumable_id']);
+      $qty      = (int)($p['quantity'] ?? 1);
+    ?>
+    <div style="display:inline-flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid <?= $isLinked?'var(--accent)':'var(--border)' ?>;border-radius:20px;padding:4px 12px;margin:3px;font-size:12px">
+      <?= $isLinked ? '📦' : '🔩' ?>
+      <span><?= h($p['part_name']) ?></span>
+      <?php if($p['part_code']): ?><span style="color:var(--text3);font-family:var(--mono)"><?= h($p['part_code']) ?></span><?php endif; ?>
+      <?php if($qty > 1): ?><span style="background:var(--accent-dim);color:var(--accent);border-radius:10px;padding:0 6px;font-family:var(--mono)">×<?= $qty ?></span><?php endif; ?>
+    </div>
+    <?php endforeach; ?>
+  </div>
+  <?php endif; ?>
+  <?php if ($t['notes']): ?>
+  <div class="section-title">Note tecniche interne</div>
+  <div style="background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:20px;font-size:14px;line-height:1.6"><?= nl2br(h($t['notes'])) ?></div>
+  <?php endif; ?>
+  <?php if (!empty($t['work_report'])): ?>
+  <div class="section-title" style="color:var(--accent);border-bottom-color:var(--accent)">📋 Lavoro svolto</div>
+  <div style="background:var(--surface2);border:1px solid var(--accent);border-radius:var(--radius);padding:16px;margin-bottom:20px;font-size:14px;line-height:1.7;white-space:pre-wrap"><?= h($t['work_report']) ?></div>
+  <?php endif; ?>
+  <div class="section-title">Allegati (<?= count($t['files']) ?>)</div>
+  <?php foreach($t['files'] as $f): ?>
+  <div class="file-item"><span>📎</span><a href="/techcopy/uploads/<?= h(basename($f['filepath'])) ?>" target="_blank" style="flex:1;color:var(--accent)"><?= h($f['filename']) ?></a><span style="font-size:11px;color:var(--text2);font-family:var(--mono)"><?= number_format($f['filesize']/1024,1) ?> KB</span></div>
+  <?php endforeach; ?>
+  <?php if (empty($t['files'])): ?><p style="color:var(--text2);font-size:13px">Nessun allegato.</p><?php endif; ?>
+</div>
+
+<!-- CRONOLOGIA -->
+<div data-tab="history" class="hidden">
+  <div class="timeline">
+    <?php foreach($t['history'] as $h): ?>
+    <div class="timeline-item">
+      <div class="tl-dot">📌</div>
+      <div class="tl-line"></div>
+      <div class="tl-content">
+        <h5><?= h($h['action']) ?></h5>
+        <p>da <?= h($h['user_name']) ?></p>
+        <div class="tl-time"><?= h($h['created_at']) ?></div>
+      </div>
+    </div>
+    <?php endforeach; ?>
+  </div>
+</div>
+
+<!-- MODIFICA -->
+<?php if ($canEdit): ?>
+<div data-tab="edit" class="hidden">
+  <form method="POST" enctype="multipart/form-data" id="edit-form">
+      <?= csrf_field() ?>
+    <input type="hidden" name="action" value="update">
+    <input type="hidden" name="ticket_id" value="<?= $t['id'] ?>">
+    <div class="form-grid">
+      <div class="form-group form-full">
+        <label>Titolo *</label>
+        <input type="text" name="title" value="<?= h($t['title']) ?>" required>
+      </div>
+      <div class="form-group">
+        <label>Stato</label>
+        <input type="hidden" name="status" id="status-hidden" value="<?= h($t['status']) ?>">
+        <select id="status-select" onchange="document.getElementById('status-hidden').value=this.value">
+          <option value="open"    <?= $t['status']==='open'?'selected':'' ?>>Aperto</option>
+          <option value="pending" <?= $t['status']==='pending'?'selected':'' ?>>In attesa</option>
+          <option value="closed"  <?= $t['status']==='closed'?'selected':'' ?>>Chiuso</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Priorità</label>
+        <select name="priority">
+          <option value="normal" <?= $t['priority']==='normal'?'selected':'' ?>>Normale</option>
+          <option value="high"   <?= $t['priority']==='high'?'selected':'' ?>>Alta</option>
+          <option value="urgent" <?= $t['priority']==='urgent'?'selected':'' ?>>Urgente</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Tipo intervento</label>
+        <select name="type">
+          <?php foreach(['guasto','manutenzione','errore','installazione','consulenza'] as $v): ?>
+          <option <?= $t['type']===$v?'selected':'' ?>><?= $v ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Responsabile principale</label>
+        <select name="tech_id">
+          <option value="">— Nessuno —</option>
+          <?php foreach($techUsers as $u): ?>
+          <option value="<?= $u['id'] ?>" <?= $t['tech_id']==$u['id']?'selected':'' ?>><?= h($u['name']) ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <div class="form-group form-full">
+        <label style="display:flex;align-items:center;gap:8px">
+          👥 Team assegnato
+          <span style="font-size:11px;font-weight:400;color:var(--text2);text-transform:none;letter-spacing:0;font-family:var(--sans)">Seleziona tutti i tecnici/supervisori coinvolti nell'intervento</span>
+        </label>
+        <div style="display:flex;flex-direction:column;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:12px">
+          <?php
+          $assignedIds = array_column($t['assigned_users'] ?? [], 'user_id');
+          foreach ($techUsers as $u):
+          ?>
+          <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:6px 8px;border-radius:4px;transition:background .15s" onmouseover="this.style.background='var(--surface3)'" onmouseout="this.style.background=''">
+            <input type="checkbox" name="assigned_users[]" value="<?= $u['id'] ?>"
+              <?= in_array($u['id'], $assignedIds) ? 'checked' : '' ?>
+              style="width:auto;accent-color:var(--accent)">
+            <div style="width:28px;height:28px;border-radius:50%;background:<?= h($u['color']) ?>22;color:<?= h($u['color']) ?>;border:1.5px solid <?= h($u['color']) ?>;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0"><?= h($u['avatar']) ?></div>
+            <span style="font-size:13px;flex:1"><?= h($u['name']) ?></span>
+            <span class="badge badge-<?= h($u['role']) ?>" style="font-size:10px"><?= match($u['role']){'admin'=>'👑','supervisor'=>'🔍','tech'=>'🔧',default=>''} ?> <?= h(match($u['role']){'admin'=>'Admin','supervisor'=>'Sup.','tech'=>'Tecnico',default=>$u['role']}) ?></span>
+          </label>
+          <?php endforeach; ?>
+        </div>
+        <div style="font-size:11px;color:var(--text3);margin-top:6px">Il responsabile principale viene aggiunto automaticamente al team.</div>
+      </div>
+      <div class="form-group">
+        <label>Tempo spostamento (min)</label>
+        <input type="number" name="travel_time" value="<?= (int)$t['travel_time'] ?>" min="0">
+      </div>
+      <div class="form-group">
+        <label>Tempo lavoro (min)</label>
+        <input type="number" name="work_time" value="<?= (int)$t['work_time'] ?>" min="0">
+      </div>
+      <div class="form-group">
+        <label>Contatore BN (intervento)</label>
+        <input type="number" name="counter_bw" value="<?= (int)$t['counter_bw'] ?>" min="0">
+      </div>
+      <div class="form-group">
+        <label>Contatore Colore (intervento)</label>
+        <input type="number" name="counter_color" value="<?= (int)$t['counter_color'] ?>" min="0">
+      </div>
+      <!-- ══ COMPONENTI SOSTITUITI (collegati al magazzino) ══ -->
+      <div class="form-group form-full">
+        <label style="font-family:var(--mono);font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text2)">
+          📦 Componenti sostituiti — stock magazzino
+        </label>
+        <div id="parts-list" style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">
+          <?php
+          // Carica i componenti già salvati (con e senza consumable_id)
+          $linkedParts = array_filter($t['parts'], fn($p) => !empty($p['consumable_id']));
+          $freeParts   = array_filter($t['parts'], fn($p) =>  empty($p['consumable_id']));
+          foreach ($linkedParts as $idx => $p): ?>
+          <div class="part-row" style="display:flex;gap:8px;align-items:center;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px">
+            <select name="consumable_id[]" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:7px 10px;color:var(--text);font-size:13px;font-family:var(--sans)">
+              <option value="">— Seleziona dal magazzino —</option>
+              <?php foreach($consumables as $con): ?>
+              <option value="<?= $con['id'] ?>" <?= $con['id']==$p['consumable_id']?'selected':'' ?>>
+                <?= h($con['name']) ?> (<?= h($con['code']) ?>) — Stock: <?= $con['stock'] ?> <?= h($con['unit']) ?>
+              </option>
+              <?php endforeach; ?>
+            </select>
+            <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+              <label style="font-size:12px;color:var(--text2);white-space:nowrap">Qtà:</label>
+              <input type="number" name="consumable_qty[]" value="<?= (int)$p['quantity'] ?>" min="1" style="width:64px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:7px 8px;color:var(--text);font-size:13px;font-family:var(--mono);text-align:center">
+            </div>
+            <button type="button" class="btn btn-danger btn-sm" onclick="this.closest('.part-row').remove()" title="Rimuovi">✕</button>
+          </div>
+          <?php endforeach; ?>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="addPartRow()" style="margin-bottom:12px">
+          ➕ Aggiungi componente da magazzino
+        </button>
+
+        <!-- Componenti liberi: non in magazzino -->
+        <label style="font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text3);margin-bottom:6px;display:block">
+          Componenti non in magazzino (testo libero)
+        </label>
+        <div id="free-parts-list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px">
+          <?php foreach($freeParts as $p): ?>
+          <div class="free-row" style="display:flex;gap:8px;align-items:center">
+            <input type="text" name="part_free[]" value="<?= h($p['part_name']) ?>"
+              placeholder="Es: Cinghia di trasmissione, Rullo pressore..."
+              style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px 12px;color:var(--text);font-size:13px;font-family:var(--sans)">
+            <button type="button" class="btn btn-danger btn-sm" onclick="this.closest('.free-row').remove()" title="Rimuovi">✕</button>
+          </div>
+          <?php endforeach; ?>
+        </div>
+        <button type="button" class="btn btn-secondary btn-sm" onclick="addFreeRow()">
+          ➕ Aggiungi componente libero
+        </button>
+
+        <!-- Template nascosti per JS -->
+        <template id="tpl-part-row">
+          <div class="part-row" style="display:flex;gap:8px;align-items:center;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px">
+            <select name="consumable_id[]" style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:7px 10px;color:var(--text);font-size:13px;font-family:var(--sans)">
+              <option value="">— Seleziona dal magazzino —</option>
+              <?php foreach($consumables as $con): ?>
+              <option value="<?= $con['id'] ?>">
+                <?= h($con['name']) ?> (<?= h($con['code']) ?>) — Stock: <?= $con['stock'] ?> <?= h($con['unit']) ?>
+              </option>
+              <?php endforeach; ?>
+            </select>
+            <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+              <label style="font-size:12px;color:var(--text2);white-space:nowrap">Qtà:</label>
+              <input type="number" name="consumable_qty[]" value="1" min="1" style="width:64px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:7px 8px;color:var(--text);font-size:13px;font-family:var(--mono);text-align:center">
+            </div>
+            <button type="button" class="btn btn-danger btn-sm" onclick="this.closest('.part-row').remove()" title="Rimuovi">✕</button>
+          </div>
+        </template>
+        <template id="tpl-free-row">
+          <div class="free-row" style="display:flex;gap:8px;align-items:center">
+            <input type="text" name="part_free[]" placeholder="Es: Cinghia di trasmissione, Rullo pressore..."
+              style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:8px 12px;color:var(--text);font-size:13px;font-family:var(--sans)">
+            <button type="button" class="btn btn-danger btn-sm" onclick="this.closest('.free-row').remove()" title="Rimuovi">✕</button>
+          </div>
+        </template>
+      </div>
+      <div class="form-group form-full">
+        <label>Descrizione</label>
+        <textarea name="description"><?= h($t['description']) ?></textarea>
+      </div>
+      <div class="form-group form-full">
+        <label>Note tecniche interne</label>
+        <textarea name="notes" placeholder="Note visibili solo internamente (es. attrezzature usate, osservazioni, avvertenze per interventi futuri...)"><?= h($t['notes']) ?></textarea>
+      </div>
+      <div class="form-group form-full">
+        <label style="display:flex;align-items:center;gap:8px">
+          📋 Lavoro svolto
+          <span style="font-size:11px;font-weight:400;color:var(--text2);text-transform:none;letter-spacing:0;font-family:var(--sans)">Resoconto delle operazioni eseguite dal tecnico presso il cliente</span>
+        </label>
+        <textarea name="work_report" rows="5"
+          placeholder="Es: Sostituito toner nero e ciano. Puliti rulli alimentazione e ADF. Eseguita calibrazione colori. Contatore BN al momento dell'intervento: 45.380. Stampante funzionante al 100%."
+          style="min-height:110px"><?= h($t['work_report'] ?? '') ?></textarea>
+      </div>
+      <div class="form-group form-full">
+        <label style="font-family:var(--mono);font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text2)">Chiusura intervento</label>
+        <label class="form-check" style="padding:12px 16px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);gap:12px;font-size:14px;color:var(--text)">
+          <input type="checkbox" name="resolved" id="chk-resolved" <?= $t['resolved']?'checked':'' ?>>
+          <span>✅ Intervento risolto — spunta per chiudere automaticamente l'assistenza</span>
+        </label>
+        <div id="resolved-notice" style="display:<?= $t['resolved']?'flex':'none' ?>;align-items:center;gap:8px;margin-top:8px;padding:10px 14px;background:var(--green-dim);border:1px solid var(--green);border-radius:var(--radius);font-size:13px;color:var(--green)">
+          🟢 Lo stato verrà impostato su <strong>Chiuso</strong> al salvataggio.
+        </div>
+      </div>
+      <div class="form-group form-full">
+        <label>Aggiungi allegato</label>
+        <div class="file-drop" onclick="document.getElementById('file-input').click()">
+          📎 Clicca per caricare (PDF, immagini, documenti — max <?= UPLOAD_MAX_MB ?>MB)
+          <input type="file" id="file-input" name="attachment" style="display:none">
+        </div>
+        <div class="file-list" id="file-list"></div>
+      </div>
+    </div>
+    <div class="divider"></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button type="submit" class="btn btn-primary">💾 Salva modifiche</button>
+      <?php if (is_admin()): ?>
+      <button type="button" class="btn btn-danger" onclick="confirmDelete('del-form','Eliminare definitivamente questo intervento?')">🗑️ Elimina intervento</button>
+      <?php endif; ?>
+    </div>
+  </form>
+
+  <?php if (is_admin()): ?>
+  <!-- Form eliminazione FUORI dal form principale — mai annidare form -->
+  <form method="POST" id="del-form" style="display:none">
+      <?= csrf_field() ?>
+    <input type="hidden" name="action" value="delete">
+    <input type="hidden" name="ticket_id" value="<?= $t['id'] ?>">
+  </form>
+  <?php endif; ?>
+</div>
+<?php endif; ?>
+
+<?php else: ?>
+<!-- ══ LISTA TICKET ══════════════════════════════════════════ -->
+<?php if ($techFilter): ?>
+<div class="alert alert-info" style="margin-bottom:12px">👤 Visualizzi solo i tuoi interventi assegnati.</div>
+<?php endif; ?>
+
+<div class="filter-bar">
+  <form method="GET" style="display:contents">
+    <a href="?filter=all"     class="btn btn-sm <?= $filter==='all'?'btn-primary':'btn-secondary' ?>">Tutti (<?= $allCount ?>)</a>
+    <a href="?filter=open"    class="btn btn-sm <?= $filter==='open'?'btn-primary':'btn-secondary' ?>">🟠 Aperti (<?= $counts['open']??0 ?>)</a>
+    <a href="?filter=pending" class="btn btn-sm <?= $filter==='pending'?'btn-primary':'btn-secondary' ?>">🟡 In attesa (<?= $counts['pending']??0 ?>)</a>
+    <a href="?filter=closed"  class="btn btn-sm <?= $filter==='closed'?'btn-primary':'btn-secondary' ?>">🟢 Chiusi (<?= $counts['closed']??0 ?>)</a>
+    <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <div class="search-bar">
+        <span>🔍</span>
+        <input name="q" value="<?= h($search) ?>" placeholder="Cerca..." oninput="this.form.submit()">
+        <input type="hidden" name="filter" value="<?= h($filter) ?>">
+      </div>
+      <?php if (can_create_ticket()): ?>
+      <a href="/techcopy/pages/ticket_form.php" class="btn btn-primary btn-sm">➕ Nuovo Intervento</a>
+      <?php endif; ?>
+    </div>
+  </form>
+</div>
+
+<?php foreach ($tickets as $t):
+  $cls = $t['priority']==='urgent' ? 'urgent' : ($t['status']==='closed' ? 'closed' : 'open'); ?>
+<a href="?id=<?= $t['id'] ?>&filter=<?= h($filter) ?>" class="ticket-card <?= $cls ?>" style="display:block">
+  <div class="ticket-top">
+    <span class="ticket-id">#<?= str_pad($t['id'],4,'0',STR_PAD_LEFT) ?></span>
+    <span class="ticket-title"><?= h($t['title']) ?></span>
+    <span class="chip"><?= h($t['type']) ?></span>
+    <?= status_badge($t['status']) ?>
+    <?= priority_badge($t['priority']) ?>
+  </div>
+  <div class="ticket-meta">
+    <span>🏢 <?= h($t['client_name']) ?></span>
+    <span>🖨️ <?= h($t['brand'].' '.$t['model']) ?></span>
+    <span style="color:<?= h($t['tech_color']??'var(--text2)') ?>">👤 <?= h($t['tech_name']??'Non assegnato') ?></span>
+    <?php if (!empty($t['extra_count']) && $t['extra_count'] > 0): ?>
+    <span style="color:var(--text3)">+<?= $t['extra_count'] ?> altri</span>
+    <?php endif; ?>
+    <span>📅 <?= substr($t['created_at'],0,10) ?></span>
+    <?php if($t['work_time']>0): ?><span>⏱️ <?= format_minutes((int)$t['work_time']) ?></span><?php endif; ?>
+  </div>
+</a>
+<?php endforeach; ?>
+<?php if (empty($tickets)): ?>
+<div style="text-align:center;padding:60px 20px;color:var(--text2)">
+  <div style="font-size:48px;margin-bottom:12px">🎉</div>
+  <p>Nessun intervento trovato.</p>
+</div>
+<?php endif; ?>
+<?php endif; ?>
+
+<?php layout_footer(); ?>
+<script>
+function addPartRow() {
+  const tpl = document.getElementById('tpl-part-row');
+  if (!tpl) return;
+  const clone = tpl.content.cloneNode(true);
+  document.getElementById('parts-list').appendChild(clone);
+}
+function addFreeRow() {
+  const tpl = document.getElementById('tpl-free-row');
+  if (!tpl) return;
+  const clone = tpl.content.cloneNode(true);
+  document.getElementById('free-parts-list').appendChild(clone);
+}
+</script>

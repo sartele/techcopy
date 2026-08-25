@@ -1,0 +1,279 @@
+<?php
+// ============================================================
+//  TechCopy v2.0 — Setup / Reset installazione
+//
+//  1. Copia in: C:\xampp\htdocs\techcopy\setup.php
+//  2. Apri:     http://localhost/techcopy/setup.php
+//  3. Clicca "Esegui Setup"
+//  4. ELIMINA questo file dopo il primo accesso
+// ============================================================
+
+$DB_HOST = 'localhost';
+$DB_USER = 'root';
+$DB_PASS = '';          // modifica se hai una password MySQL
+$DB_NAME = 'techcopy';
+
+$messages = []; $errors = []; $done = false;
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    try {
+        $pdo = new PDO("mysql:host={$DB_HOST};charset=utf8mb4", $DB_USER, $DB_PASS,
+            [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION]);
+
+        $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$DB_NAME}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+        $pdo->exec("USE `{$DB_NAME}`");
+        $messages[] = "✅ Database '{$DB_NAME}' pronto.";
+
+        // ── TABELLE ──────────────────────────────────────────
+        $pdo->exec("CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(100) NOT NULL, email VARCHAR(150) NOT NULL UNIQUE,
+            password VARCHAR(255) NOT NULL,
+            role ENUM('admin','supervisor','tech','viewer') NOT NULL DEFAULT 'tech',
+            avatar VARCHAR(4) NOT NULL DEFAULT 'US', color VARCHAR(10) NOT NULL DEFAULT '#00d4ff',
+            active TINYINT(1) NOT NULL DEFAULT 1,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS clients (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(150) NOT NULL, contact VARCHAR(100), phone VARCHAR(30),
+            email VARCHAR(150), address VARCHAR(255), city VARCHAR(100), zip VARCHAR(10),
+            lat DECIMAL(10,7) DEFAULT NULL, lng DECIMAL(10,7) DEFAULT NULL,
+            notes TEXT, active TINYINT(1) NOT NULL DEFAULT 1,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS printers (
+            id INT AUTO_INCREMENT PRIMARY KEY, client_id INT NOT NULL,
+            brand VARCHAR(80) NOT NULL, model VARCHAR(100) NOT NULL, serial VARCHAR(80) NOT NULL,
+            type ENUM('color','bw') NOT NULL DEFAULT 'bw', location VARCHAR(150),
+            rete_lan TINYINT(1) NOT NULL DEFAULT 0, rete_wifi TINYINT(1) NOT NULL DEFAULT 0,
+            adf ENUM('none','simple','duplex') NOT NULL DEFAULT 'none',
+            has_duplex TINYINT(1) NOT NULL DEFAULT 0, has_scan TINYINT(1) NOT NULL DEFAULT 0,
+            counter_bw BIGINT NOT NULL DEFAULT 0, counter_color BIGINT NOT NULL DEFAULT 0,
+            purchase_date DATE DEFAULT NULL, warranty_exp DATE DEFAULT NULL,
+            notes TEXT, active TINYINT(1) NOT NULL DEFAULT 1,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS tickets (
+            id INT AUTO_INCREMENT PRIMARY KEY, client_id INT NOT NULL,
+            printer_id INT, tech_id INT,
+            status ENUM('open','pending','closed') NOT NULL DEFAULT 'open',
+            priority ENUM('normal','high','urgent') NOT NULL DEFAULT 'normal',
+            type ENUM('guasto','manutenzione','errore','installazione','consulenza') NOT NULL DEFAULT 'guasto',
+            title VARCHAR(255) NOT NULL, description TEXT, notes TEXT,
+            travel_time INT NOT NULL DEFAULT 0, work_time INT NOT NULL DEFAULT 0,
+            counter_bw BIGINT DEFAULT NULL, counter_color BIGINT DEFAULT NULL,
+            resolved TINYINT(1) NOT NULL DEFAULT 0, closed_at DATETIME DEFAULT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (client_id)  REFERENCES clients(id)  ON DELETE CASCADE,
+            FOREIGN KEY (printer_id) REFERENCES printers(id) ON DELETE SET NULL,
+            FOREIGN KEY (tech_id)    REFERENCES users(id)    ON DELETE SET NULL
+        ) ENGINE=InnoDB");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS ticket_history (
+            id INT AUTO_INCREMENT PRIMARY KEY, ticket_id INT NOT NULL,
+            user_id INT, user_name VARCHAR(100), action TEXT NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS ticket_parts (
+            id INT AUTO_INCREMENT PRIMARY KEY, ticket_id INT NOT NULL,
+            part_name VARCHAR(255) NOT NULL, part_code VARCHAR(100),
+            quantity INT NOT NULL DEFAULT 1, notes VARCHAR(255),
+            FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS ticket_files (
+            id INT AUTO_INCREMENT PRIMARY KEY, ticket_id INT NOT NULL,
+            user_id INT, filename VARCHAR(255) NOT NULL, filepath VARCHAR(500) NOT NULL,
+            filesize INT, mime_type VARCHAR(100),
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS consumables (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(200) NOT NULL, code VARCHAR(100) NOT NULL,
+            brand VARCHAR(100), type ENUM('toner','drum','carta','ricambio','altro') NOT NULL DEFAULT 'toner',
+            color VARCHAR(30) DEFAULT '', stock INT NOT NULL DEFAULT 0,
+            min_stock INT NOT NULL DEFAULT 2, unit VARCHAR(20) NOT NULL DEFAULT 'pz',
+            price DECIMAL(10,2) DEFAULT NULL, supplier VARCHAR(150), notes TEXT,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB");
+
+        $pdo->exec("CREATE TABLE IF NOT EXISTS stock_movements (
+            id INT AUTO_INCREMENT PRIMARY KEY, consumable_id INT NOT NULL,
+            ticket_id INT DEFAULT NULL, user_id INT DEFAULT NULL,
+            type ENUM('carico','scarico','rettifica') NOT NULL,
+            quantity INT NOT NULL, notes VARCHAR(255),
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (consumable_id) REFERENCES consumables(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB");
+
+        $messages[] = "✅ Tutte le tabelle create / verificate.";
+
+        // ── UTENTI DEMO (password generata dal PHP locale) ──
+        $pwd = password_hash('admin123', PASSWORD_DEFAULT);
+        $users = [
+            ['Marco Rossi',  'admin@techcopy.it',   'admin',      'MR', '#a78bfa'],
+            ['Chiara Russo', 'chiara@techcopy.it',  'supervisor', 'CR', '#00d4ff'],
+            ['Luca Ferrari', 'luca@techcopy.it',    'tech',       'LF', '#39d353'],
+            ['Sara Bianchi', 'sara@techcopy.it',    'tech',       'SB', '#f79000'],
+            ['Giorgio Neri', 'giorgio@techcopy.it', 'viewer',     'GN', '#8b98a8'],
+        ];
+        $ins = $pdo->prepare("INSERT IGNORE INTO users (name,email,password,role,avatar,color) VALUES (?,?,?,?,?,?)");
+        $upd = $pdo->prepare("UPDATE users SET password=? WHERE email=?");
+        foreach ($users as $u) { $ins->execute([$u[0],$u[1],$pwd,$u[2],$u[3],$u[4]]); $upd->execute([$pwd,$u[1]]); }
+        $messages[] = "✅ Utenti demo inseriti/aggiornati — password: <strong>admin123</strong>.";
+
+        // ── CLIENTI DEMO ──
+        if ($pdo->query("SELECT COUNT(*) FROM clients")->fetchColumn() == 0) {
+            $ic = $pdo->prepare("INSERT INTO clients (name,contact,phone,email,address,city,zip,lat,lng,notes) VALUES (?,?,?,?,?,?,?,?,?,?)");
+            foreach ([
+                ['Studio Legale Moretti','Avv. Paolo Moretti','02-4567890','moretti@studiolegale.it','Via Roma 45','Milano','20121',45.4654,9.1859,'Ufficio al 3° piano'],
+                ['Farmacia Centrale','Dr.ssa Anna Conti','02-9876543','info@farmaciacentrale.it','Corso Buenos Aires 78','Milano','20124',45.4773,9.2099,'Aperto 8:00-20:00'],
+                ['Officina Meccanica Belli','Sig. Roberto Belli','02-3334455','belli@gmail.com','Via Industria 12','Sesto San Giovanni','20099',45.5329,9.2325,''],
+                ['Comune di Rho','Sig.ra Teresa Mancini','02-1122334','protocollo@comune.rho.it','Piazza Visconti 1','Rho','20017',45.5241,9.0426,'Portone laterale'],
+                ['Istituto Comprensivo Einstein','Preside Luca Vitali','02-5544332','segreteria@iceinstein.edu.it','Via Galileo 33','Cinisello Balsamo','20092',45.5506,9.2218,'7:30-17:00'],
+            ] as $r) $ic->execute($r);
+            $messages[] = "✅ Clienti demo inseriti.";
+        } else { $messages[] = "ℹ️ Clienti già presenti, saltati."; }
+
+        // ── STAMPANTI DEMO ──
+        if ($pdo->query("SELECT COUNT(*) FROM printers")->fetchColumn() == 0) {
+            $ip = $pdo->prepare("INSERT INTO printers (client_id,brand,model,serial,type,location,rete_lan,rete_wifi,adf,has_duplex,has_scan,counter_bw,counter_color) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
+            foreach ([
+                [1,'Konica Minolta','bizhub C308',        'A7PY000123', 'color','Ufficio principale', 1,1,'duplex',1,1,45200,12300],
+                [1,'HP',            'LaserJet Pro M428fdn','VNB3S90123', 'bw',  'Sala conferenze',    1,0,'simple',1,1,89000,0],
+                [2,'Ricoh',         'IM C3000',           'E5030012345','color','Retro cassa',        1,1,'duplex',1,1,23400,8900],
+                [3,'Canon',         'imageRUNNER 2630i',  'PPX11234',   'bw',  'Ufficio',            1,0,'none',  0,0,156000,0],
+                [4,'Xerox',         'VersaLink C405',     '3C6A001234', 'color','Ufficio tecnico',    1,1,'duplex',1,1,34500,19800],
+                [5,'Kyocera',       'TASKalfa 3554ci',    'V2Y390012',  'color','Segreteria',         1,0,'simple',1,1,67800,31200],
+            ] as $r) $ip->execute($r);
+            $messages[] = "✅ Stampanti demo inserite.";
+        } else { $messages[] = "ℹ️ Stampanti già presenti, saltate."; }
+
+        // ── TICKET DEMO ──
+        if ($pdo->query("SELECT COUNT(*) FROM tickets")->fetchColumn() == 0) {
+            $t2 = $pdo->query("SELECT id FROM users WHERE email='luca@techcopy.it'")->fetchColumn();
+            $t3 = $pdo->query("SELECT id FROM users WHERE email='sara@techcopy.it'")->fetchColumn();
+            $it = $pdo->prepare("INSERT INTO tickets (client_id,printer_id,tech_id,status,priority,type,title,description,travel_time,work_time,counter_bw,counter_color,resolved) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
+            foreach ([
+                [1,1,$t2,'open',  'urgent','guasto',      'Carta inceppata frequentemente',            'Inceppamento al cassetto 2 ogni 10-15 stampe. Errore E04-001.',35, 0,  45380,12345,0],
+                [2,3,$t3,'pending','normal','manutenzione','Manutenzione periodica + cambio toner',     'Manutenzione semestrale, toner nero e magenta, pulizia ADF.',  20, 90, 23480,8920, 0],
+                [4,5,$t2,'closed','normal', 'guasto',      'Qualità stampa degradata - righe verticali','Righe verticali su tutti i colori. Drum sostituiti.',          45, 120,34500,19780,1],
+                [5,6,$t3,'open',  'high',   'errore',      'Stampante offline dopo aggiornamento',      'Offline dalla rete dopo aggiornamento firmware.',               0,  0,  67800,31200,0],
+            ] as $r) {
+                $it->execute($r);
+                $tid=$pdo->lastInsertId();
+                $pdo->prepare("INSERT INTO ticket_history (ticket_id,user_id,user_name,action) VALUES (?,'1','Marco Rossi','Ticket aperto')")->execute([$tid]);
+            }
+            // Parti sostituite
+            $tids=$pdo->query("SELECT id FROM tickets ORDER BY id")->fetchAll(PDO::FETCH_COLUMN);
+            $ipart=$pdo->prepare("INSERT INTO ticket_parts (ticket_id,part_name,part_code) VALUES (?,?,?)");
+            if (isset($tids[1])) { $ipart->execute([$tids[1],'Toner Nero Ricoh IM C3000','842312']); $ipart->execute([$tids[1],'Toner Magenta Ricoh IM C3000','842314']); }
+            if (isset($tids[2])) { $ipart->execute([$tids[2],'Drum Unit Xerox C405 Ciano','101R00603']); $ipart->execute([$tids[2],'Drum Unit Xerox C405 Magenta','101R00604']); }
+            $messages[] = "✅ Interventi demo inseriti.";
+        } else { $messages[] = "ℹ️ Interventi già presenti, saltati."; }
+
+        // ── CONSUMABILI DEMO ──
+        if ($pdo->query("SELECT COUNT(*) FROM consumables")->fetchColumn() == 0) {
+            $icon=$pdo->prepare("INSERT INTO consumables (name,code,brand,type,color,stock,min_stock,unit) VALUES (?,?,?,?,?,?,?,?)");
+            foreach ([
+                ['Toner Nero KM bizhub C308',   'TNP-44K',   'Konica Minolta','toner',  'black',  3,2,'pz'],
+                ['Toner Ciano KM bizhub C308',  'TNP-44C',   'Konica Minolta','toner',  'cyan',   2,2,'pz'],
+                ['Toner Magenta KM bizhub C308','TNP-44M',   'Konica Minolta','toner',  'magenta',1,2,'pz'],
+                ['Toner Giallo KM bizhub C308', 'TNP-44Y',   'Konica Minolta','toner',  'yellow', 2,2,'pz'],
+                ['Toner Nero Ricoh IM C3000',   '842312',    'Ricoh',         'toner',  'black',  0,2,'pz'],
+                ['Toner Magenta Ricoh IM C3000','842314',    'Ricoh',         'toner',  'magenta',1,2,'pz'],
+                ['Drum Unit Xerox C405 Ciano',  '101R00603', 'Xerox',         'drum',   'cyan',   1,1,'pz'],
+                ['Drum Unit Xerox C405 Magenta','101R00604', 'Xerox',         'drum',   'magenta',0,1,'pz'],
+                ['Carta A4 80g/m² (risma)',     'CARTA-A4-80','Generica',     'carta',  '',      45,20,'risma'],
+                ['Rullo alimentazione HP LJ Pro','RM1-6414', 'HP',            'ricambio','',      2,1,'pz'],
+            ] as $r) $icon->execute($r);
+            $messages[] = "✅ Consumabili demo inseriti.";
+        } else { $messages[] = "ℹ️ Consumabili già presenti, saltati."; }
+
+        $done = true;
+    } catch (PDOException $e) {
+        $errors[] = "❌ Errore database: ".$e->getMessage();
+    }
+}
+?>
+<!DOCTYPE html><html lang="it"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TechCopy — Setup</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.box{width:580px;max-width:100%;background:#161b22;border:1px solid #2a3448;border-radius:12px;padding:40px;box-shadow:0 8px 40px rgba(0,0,0,.5)}
+h1{font-size:22px;color:#00d4ff;margin-bottom:6px;font-family:monospace}
+.sub{font-size:13px;color:#8b98a8;margin-bottom:24px}
+.step{background:#1c2230;border:1px solid #2a3448;border-radius:8px;padding:14px;margin-bottom:12px;font-size:13px;line-height:1.6}
+.step code{background:#0d1117;padding:2px 6px;border-radius:4px;font-family:monospace;font-size:12px;color:#00d4ff}
+.btn{display:block;width:100%;padding:14px;background:#00d4ff;color:#000;border:none;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;margin-top:20px}
+.btn:hover{background:#00b8e0}
+.msg-ok {padding:10px 14px;border-radius:6px;font-size:13px;margin-bottom:8px;background:rgba(57,211,83,.1);border:1px solid #39d353;color:#39d353}
+.msg-err{padding:10px 14px;border-radius:6px;font-size:13px;margin-bottom:8px;background:rgba(244,71,71,.1);border:1px solid #f44747;color:#f44747}
+.success{text-align:center;padding:24px;background:rgba(57,211,83,.08);border:1px solid #39d353;border-radius:10px;margin-top:20px}
+.success h2{color:#39d353;font-size:20px;margin-bottom:12px}
+.creds{background:#0d1117;border:1px solid #2a3448;border-radius:8px;padding:16px;margin:16px 0;text-align:left}
+.creds table{width:100%;border-collapse:collapse;font-size:13px}
+.creds td{padding:7px 10px;border-bottom:1px solid #2a3448}
+.creds tr:last-child td{border-bottom:none}
+.creds td:first-child{color:#8b98a8;font-family:monospace;font-size:12px}
+.warn{background:rgba(247,144,0,.1);border:1px solid #f79000;border-radius:6px;padding:12px 14px;font-size:12px;color:#f79000;margin-top:16px}
+a.go{display:inline-block;margin-top:16px;padding:12px 28px;background:#00d4ff;color:#000;border-radius:8px;font-weight:700;font-size:14px;text-decoration:none}
+</style></head><body>
+<div class="box">
+  <h1>🖨️ TechCopy v2.0 — Setup</h1>
+  <p class="sub">Installa database, tabelle e dati demo con le password corrette.</p>
+
+  <?php if (!$done): ?>
+  <div class="step">
+    <strong>Configurazione:</strong> Host: <code><?= htmlspecialchars($DB_HOST) ?></code>
+    &nbsp; DB: <code><?= htmlspecialchars($DB_NAME) ?></code>
+    &nbsp; Utente: <code><?= htmlspecialchars($DB_USER) ?></code>
+    <?php if ($DB_PASS): ?>&nbsp; Password: <code>••••</code><?php else: ?>&nbsp; <span style="color:#f79000">Password: vuota (default XAMPP)</span><?php endif; ?>
+  </div>
+  <?php foreach($errors as $e): ?><div class="msg-err"><?= $e ?></div><?php endforeach; ?>
+  <?php if($errors): ?>
+  <div class="step" style="color:#f79000">⚠️ Errore di connessione. Se XAMPP usa una password MySQL, apri <code>setup.php</code> e modifica <code>$DB_PASS</code>.</div>
+  <?php endif; ?>
+  <div class="step"><strong>Verrà eseguito:</strong><br>
+    • Crea database <code>techcopy</code> se non esiste<br>
+    • Crea 9 tabelle (users, clients, printers, tickets, …)<br>
+    • Inserisce 5 utenti demo con password <code>admin123</code><br>
+    • Inserisce clienti, stampanti, interventi e consumabili demo
+  </div>
+  <form method="POST"><button type="submit" class="btn">▶ Esegui Setup</button></form>
+
+  <?php else: ?>
+  <?php foreach($messages as $m): ?><div class="msg-ok"><?= $m ?></div><?php endforeach; ?>
+  <div class="success">
+    <h2>✅ Setup completato!</h2>
+    <p>Accedi con uno di questi account:</p>
+    <div class="creds">
+      <table>
+        <tr><td>admin@techcopy.it</td><td><strong>admin123</strong></td><td style="color:#a78bfa">👑 Amministratore</td></tr>
+        <tr><td>chiara@techcopy.it</td><td><strong>admin123</strong></td><td style="color:#00d4ff">🔍 Supervisore</td></tr>
+        <tr><td>luca@techcopy.it</td><td><strong>admin123</strong></td><td style="color:#39d353">🔧 Tecnico</td></tr>
+        <tr><td>sara@techcopy.it</td><td><strong>admin123</strong></td><td style="color:#f79000">🔧 Tecnico</td></tr>
+        <tr><td>giorgio@techcopy.it</td><td><strong>admin123</strong></td><td style="color:#8b98a8">👁 Visualizzatore</td></tr>
+      </table>
+    </div>
+    <a href="/techcopy/login.php" class="go">→ Vai al Login</a>
+  </div>
+  <div class="warn">⚠️ <strong>Sicurezza:</strong> Elimina il file <code>setup.php</code> dalla cartella <code>htdocs/techcopy/</code> dopo il primo accesso.</div>
+  <?php endif; ?>
+</div>
+</body></html>

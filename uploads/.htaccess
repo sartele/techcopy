@@ -1,0 +1,20 @@
+# ============================================================
+#  TechCopy — uploads/.htaccess
+#  Blocca esecuzione script in questa cartella specifica.
+#  QUESTO file va nella cartella uploads/, non nella radice.
+# ============================================================
+
+Options -Indexes -ExecCGI
+
+# Blocca esecuzione PHP — solo in questa cartella uploads/
+<FilesMatch "\.php[0-9]?$">
+    Require all denied
+</FilesMatch>
+<FilesMatch "\.(phtml|pl|py|cgi|sh|asp|aspx|jsp)$">
+    Require all denied
+</FilesMatch>
+
+# Forza download per file non immagine
+<FilesMatch "\.(doc|docx|txt)$">
+    Header set Content-Disposition "attachment"
+</FilesMatch>

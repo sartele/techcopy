@@ -1,0 +1,116 @@
+<?php
+// ============================================================
+//  TechCopy — Layout condiviso
+// ============================================================
+require_once __DIR__ . '/auth.php';
+require_once __DIR__ . '/helpers.php';
+
+function layout_header(string $title = 'TechCopy', string $active = ''): void {
+    $user      = current_user();
+    $flash     = get_flash();
+    $openCount = 0;
+    $lowStock  = 0;
+    try {
+        // Per il tecnico mostra solo i suoi ticket aperti nel badge
+        if ($user && $user['role'] === 'tech') {
+            $openCount = db()->prepare("SELECT COUNT(*) FROM tickets WHERE status='open' AND tech_id=?");
+            $openCount->execute([$user['id']]);
+            $openCount = $openCount->fetchColumn();
+        } else {
+            $openCount = db()->query("SELECT COUNT(*) FROM tickets WHERE status='open'")->fetchColumn();
+        }
+        $lowStock = db()->query("SELECT COUNT(*) FROM consumables WHERE stock <= min_stock")->fetchColumn();
+    } catch (Exception $e) {}
+
+    $roleMeta = match($user['role'] ?? '') {
+        'admin'      => ['👑', '#a78bfa', 'Amministratore'],
+        'supervisor' => ['🔍', '#00d4ff', 'Supervisore'],
+        'tech'       => ['🔧', '#39d353', 'Tecnico'],
+        'viewer'     => ['👁',  '#8b98a8', 'Visualizzatore'],
+        default      => ['•',  '#8b98a8', ''],
+    };
+?>
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title><?= h($title) ?> — Assistenza Stampanti</title>
+<link rel="icon" type="image/png" href="/techcopy/assets/img/favicon.png">
+<link rel="apple-touch-icon" href="/techcopy/assets/img/favicon.png">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/techcopy/assets/css/style.css">
+</head>
+<body>
+<div class="app">
+  <div class="sidebar-backdrop" id="sidebar-backdrop" onclick="closeMobileMenu()"></div>
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-logo">
+      <h2><img src="/techcopy/assets/img/favicon.png" width="20" height="20"> Assistenza</h2>
+      <p>Stampanti &amp; Fotocopiatori</p>
+    </div>
+
+    <?php if ($user): ?>
+    <div class="sidebar-user">
+      <div class="avatar" style="background:<?= h($user['color']) ?>22;color:<?= h($user['color']) ?>;border:1.5px solid <?= h($user['color']) ?>"><?= h($user['avatar']) ?></div>
+      <div class="info">
+        <div class="name"><?= h($user['name']) ?></div>
+        <div class="role" style="color:<?= $roleMeta[1] ?>;font-size:11px"><?= $roleMeta[0] ?> <?= $roleMeta[2] ?></div>
+      </div>
+    </div>
+    <?php endif; ?>
+
+    <nav class="sidebar-nav">
+      <div class="nav-section">Principale</div>
+      <a href="/techcopy/index.php"              class="nav-item <?= $active==='dashboard'?'active':'' ?>"><span class="icon">📊</span> Dashboard</a>
+      <a href="/techcopy/pages/map.php"          class="nav-item <?= $active==='map'?'active':'' ?>"><span class="icon">🗺️</span> Mappa Clienti</a>
+
+      <div class="nav-section">Operativo</div>
+      <a href="/techcopy/pages/tickets.php"      class="nav-item <?= $active==='tickets'?'active':'' ?>">
+        <span class="icon">🔧</span> Interventi
+        <?php if ($openCount > 0): ?><span class="nav-badge"><?= $openCount ?></span><?php endif; ?>
+      </a>
+      <a href="/techcopy/pages/clients.php"      class="nav-item <?= $active==='clients'?'active':'' ?>"><span class="icon">🏢</span> Clienti</a>
+      <a href="/techcopy/pages/printers.php"     class="nav-item <?= $active==='printers'?'active':'' ?>"><span class="icon">🖨️</span> Stampanti</a>
+
+      <div class="nav-section">Gestione</div>
+      <a href="/techcopy/pages/consumables.php"  class="nav-item <?= $active==='consumables'?'active':'' ?>">
+        <span class="icon">📦</span> Consumabili
+        <?php if ($lowStock > 0): ?><span class="nav-badge" style="background:var(--orange)"><?= $lowStock ?></span><?php endif; ?>
+      </a>
+      <?php if ($user && $user['role'] === 'admin'): ?>
+      <a href="/techcopy/pages/users.php"        class="nav-item <?= $active==='users'?'active':'' ?>"><span class="icon">👥</span> Utenti</a>
+      <?php endif; ?>
+    </nav>
+
+    <div class="sidebar-footer">
+      <a href="/techcopy/logout.php" class="btn btn-secondary btn-full btn-sm">⏻ Esci</a>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-toggle" onclick="toggleMenu()" aria-label="Menu">☰</button>
+      <h3><?= h($title) ?></h3>
+      <div class="topbar-actions" id="topbar-actions"></div>
+    </div>
+    <?php if ($flash): ?>
+    <div class="flash-msg flash-<?= h($flash['type']) ?>"><?= h($flash['msg']) ?></div>
+    <?php endif; ?>
+    <div class="page">
+<?php
+}
+
+function layout_footer(): void {
+?>
+    </div><!-- .page -->
+  </div><!-- .main -->
+</div><!-- .app -->
+<script src="/techcopy/assets/js/app.js"></script>
+</body>
+</html>
+<?php
+}

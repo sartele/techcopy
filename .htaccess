@@ -1,0 +1,43 @@
+# ============================================================
+#  TechCopy — .htaccess principale (radice progetto)
+# ============================================================
+
+Options -Indexes
+ServerSignature Off
+
+# ── BLOCCA FILE SENSIBILI (non PHP — quelli li gestisce Apache) ──
+<FilesMatch "\.(sql|log|bak|backup|env|ini|htpasswd)$">
+    Require all denied
+</FilesMatch>
+
+# ── BLOCCA ACCESSO DIRETTO AGLI INCLUDES ─────────────────────
+# Usa <Files> con path relativo — funziona in ogni sottodirectory
+<FilesMatch "^(config|auth|helpers|layout)\.php$">
+    Require all denied
+</FilesMatch>
+
+# ── HEADER DI SICUREZZA HTTP ──────────────────────────────────
+<IfModule mod_headers.c>
+    Header always set X-Frame-Options "DENY"
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-XSS-Protection "1; mode=block"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+    Header always unset X-Powered-By
+    # Attivare solo con HTTPS configurato:
+    # Header always set Strict-Transport-Security "max-age=31536000"
+</IfModule>
+
+# ── BLOCCA PATH TRAVERSAL ─────────────────────────────────────
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule ^(.*/)?\.\./ - [F,L]
+    # Blocca accesso web diretto alla cartella includes/
+    RewriteRule ^includes/ - [F,L]
+</IfModule>
+
+# ── ERRORI: NO loop, pagina generica ─────────────────────────
+# IMPORTANTE: NON usare ErrorDocument 403 che punta a un file
+# PHP interno — causa il doppio 403 che hai visto.
+# Usiamo un messaggio inline o niente (Apache mostra la sua pagina).
+# ErrorDocument 403 "Accesso non consentito"
+# ErrorDocument 404 "Pagina non trovata"

@@ -1,0 +1,3 @@
+Questa cartella riceve i file allegati caricati dagli interventi.
+Deve essere scrivibile dal server web.
+Su Linux/macOS: chmod 755 uploads/

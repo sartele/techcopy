@@ -1,0 +1,3 @@
+Questa cartella contiene i file allegati agli interventi.
+Deve essere scrivibile dal server web (Apache/XAMPP).
+Su Linux/macOS eseguire: chmod 755 uploads/
